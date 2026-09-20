@@ -1,0 +1,1463 @@
+from __future__ import annotations
+
+import math
+from datetime import datetime
+from pathlib import Path
+
+import fastf1
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+st.set_page_config(
+    page_title="F1 Prediction Dashboard",
+    page_icon="🏎️",
+    layout="wide",
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+CACHE_DIR = BASE_DIR / "cache"
+
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+fastf1.Cache.enable_cache(str(CACHE_DIR))
+
+RACE_POINTS = np.array(
+    [25, 18, 15, 12, 10, 8, 6, 4, 2, 1],
+    dtype=float,
+)
+
+DEFAULT_SIMULATIONS = 5_000
+
+CURRENT_YEAR = datetime.now().year
+AVAILABLE_YEARS = list(range(2022, CURRENT_YEAR + 1))
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_float(value, default: float = 0.0) -> float:
+    """Convert a value to float safely."""
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalise_probabilities(values: np.ndarray) -> np.ndarray:
+    """Convert positive strength values into probabilities."""
+    values = np.asarray(values, dtype=float)
+    values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+    values = np.clip(values, 1e-9, None)
+
+    total = values.sum()
+
+    if total <= 0:
+        return np.ones(len(values)) / len(values)
+
+    return values / total
+
+
+def softmax(values: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """Stable softmax calculation."""
+    values = np.asarray(values, dtype=float)
+
+    if len(values) == 0:
+        return values
+
+    temperature = max(float(temperature), 1e-6)
+    scaled = values / temperature
+    scaled = scaled - np.max(scaled)
+
+    exponentials = np.exp(scaled)
+    return exponentials / exponentials.sum()
+
+
+def clean_team_name(team_name: object) -> str:
+    """Return a usable constructor name."""
+    if team_name is None or pd.isna(team_name):
+        return "Unknown Team"
+
+    name = str(team_name).strip()
+    return name if name else "Unknown Team"
+
+
+def clean_driver_name(row: pd.Series) -> str:
+    """Return the best available driver abbreviation."""
+    abbreviation = row.get("Abbreviation")
+
+    if abbreviation is not None and not pd.isna(abbreviation):
+        abbreviation = str(abbreviation).strip()
+        if abbreviation:
+            return abbreviation
+
+    driver_number = row.get("DriverNumber")
+
+    if driver_number is not None and not pd.isna(driver_number):
+        return str(driver_number)
+
+    return "Unknown"
+
+
+def get_event_name(row: pd.Series) -> str:
+    """Return a consistent event name."""
+    for column in ("EventName", "OfficialEventName", "Location", "Country"):
+        value = row.get(column)
+
+        if value is not None and not pd.isna(value):
+            text = str(value).strip()
+            if text:
+                return text
+
+    return f"Round {int(row.get('RoundNumber', 0))}"
+
+
+def make_bar_chart(
+    dataframe: pd.DataFrame,
+    category_column: str,
+    value_column: str,
+    title: str,
+    x_label: str,
+    top_n: int = 15,
+) -> None:
+    """Display a horizontal bar chart in Streamlit."""
+    if dataframe.empty:
+        st.info("No data available for this chart.")
+        return
+
+    chart_data = dataframe.head(top_n).copy()
+    chart_data = chart_data.sort_values(value_column, ascending=True)
+
+    fig, ax = plt.subplots(figsize=(11, 7))
+    ax.barh(
+        chart_data[category_column].astype(str),
+        chart_data[value_column],
+    )
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(category_column)
+    ax.grid(axis="x", alpha=0.25)
+
+    plt.tight_layout()
+    st.pyplot(fig)
+    plt.close(fig)
+
+
+# ============================================================
+# FASTF1 DATA LOADING
+# ============================================================
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_schedule(year: int) -> pd.DataFrame:
+    """Load the official FastF1 event schedule."""
+    schedule = fastf1.get_event_schedule(year, include_testing=False)
+    schedule = schedule.copy()
+
+    if "RoundNumber" in schedule.columns:
+        schedule["RoundNumber"] = pd.to_numeric(
+            schedule["RoundNumber"],
+            errors="coerce",
+        )
+
+        schedule = schedule[
+            schedule["RoundNumber"].notna()
+            & (schedule["RoundNumber"] > 0)
+        ]
+
+        schedule["RoundNumber"] = schedule["RoundNumber"].astype(int)
+        schedule = schedule.sort_values("RoundNumber")
+
+    return schedule.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_session_results(
+    year: int,
+    round_number: int,
+    session_identifier: str,
+) -> pd.DataFrame:
+    """
+    Load session results without unnecessary telemetry.
+
+    session_identifier examples:
+    - "R" for race
+    - "Q" for qualifying
+    """
+    session = fastf1.get_session(
+        year,
+        int(round_number),
+        session_identifier,
+    )
+
+    session.load(
+        laps=False,
+        telemetry=False,
+        weather=False,
+        messages=False,
+    )
+
+    results = session.results.copy()
+    return pd.DataFrame(results)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def load_qualifying_laps(
+    year: int,
+    round_number: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load qualifying results and, when available, qualifying lap data.
+
+    Qualifying results are loaded separately so a FastF1 lap-timing failure
+    does not stop the race prediction from working. If lap data is unavailable,
+    build_race_prediction() already falls back to qualifying position.
+    """
+
+    # First load the official qualifying results without requesting lap timing.
+    qualifying_results = load_session_results(
+        year,
+        int(round_number),
+        "Q",
+    )
+
+    qualifying_laps = pd.DataFrame()
+
+    # Detailed lap timing is useful, but it should be optional.
+    try:
+        session = fastf1.get_session(
+            year,
+            int(round_number),
+            "Q",
+        )
+
+        session.load(
+            laps=True,
+            telemetry=False,
+            weather=False,
+            messages=False,
+        )
+
+        try:
+            qualifying_laps = pd.DataFrame(session.laps.copy())
+        except Exception:
+            # FastF1 can occasionally fail to expose lap timing even though
+            # qualifying results loaded correctly. In that case, continue
+            # with an empty lap table and use the grid-position fallback.
+            qualifying_laps = pd.DataFrame()
+
+    except Exception:
+        # Do not kill the whole prediction if only detailed lap data fails.
+        qualifying_laps = pd.DataFrame()
+
+    return qualifying_laps, qualifying_results
+
+
+
+def get_completed_race_data(
+    year: int,
+    schedule: pd.DataFrame,
+) -> tuple[pd.DataFrame, list[int], list[str]]:
+    """
+    Load every available race result for a season.
+
+    A round is treated as completed only when valid results with positions exist.
+    """
+    race_rows: list[pd.DataFrame] = []
+    completed_rounds: list[int] = []
+    failed_events: list[str] = []
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    number_of_events = max(len(schedule), 1)
+
+    for index, event in schedule.iterrows():
+        round_number = int(event["RoundNumber"])
+        event_name = get_event_name(event)
+
+        status.text(
+            f"Loading round {round_number}: {event_name}"
+        )
+
+        try:
+            results = load_session_results(year, round_number, "R")
+
+            if results.empty or "Position" not in results.columns:
+                continue
+
+            positions = pd.to_numeric(
+                results["Position"],
+                errors="coerce",
+            )
+
+            valid_finishers = positions.notna().sum()
+
+            if valid_finishers == 0:
+                continue
+
+            event_results = results.copy()
+            event_results["RoundNumber"] = round_number
+            event_results["EventName"] = event_name
+
+            event_results["Driver"] = event_results.apply(
+                clean_driver_name,
+                axis=1,
+            )
+
+            if "TeamName" in event_results.columns:
+                event_results["Team"] = event_results["TeamName"].apply(
+                    clean_team_name
+                )
+            else:
+                event_results["Team"] = "Unknown Team"
+
+            if "Points" in event_results.columns:
+                event_results["Points"] = pd.to_numeric(
+                    event_results["Points"],
+                    errors="coerce",
+                ).fillna(0.0)
+            else:
+                event_results["Points"] = 0.0
+
+            event_results["Position"] = positions
+            race_rows.append(event_results)
+            completed_rounds.append(round_number)
+
+        except Exception:
+            # Future or temporarily unavailable races are allowed to fail.
+            failed_events.append(event_name)
+
+        finally:
+            progress.progress((index + 1) / number_of_events)
+
+    progress.empty()
+    status.empty()
+
+    if not race_rows:
+        return pd.DataFrame(), completed_rounds, failed_events
+
+    all_results = pd.concat(race_rows, ignore_index=True)
+    return all_results, completed_rounds, failed_events
+
+
+# ============================================================
+# CURRENT STANDINGS AND STRENGTH
+# ============================================================
+
+def calculate_driver_standings(
+    race_results: pd.DataFrame,
+) -> pd.DataFrame:
+    """Calculate current driver standings from completed races."""
+    if race_results.empty:
+        return pd.DataFrame(
+            columns=[
+                "Driver",
+                "Team",
+                "Points",
+                "Wins",
+                "Podiums",
+                "Starts",
+                "AveragePoints",
+                "RecentForm",
+                "Strength",
+            ]
+        )
+
+    driver_summary = (
+        race_results
+        .groupby("Driver", as_index=False)
+        .agg(
+            Points=("Points", "sum"),
+            Wins=("Position", lambda x: int((x == 1).sum())),
+            Podiums=("Position", lambda x: int((x <= 3).sum())),
+            Starts=("RoundNumber", "nunique"),
+        )
+    )
+
+    latest_teams = (
+        race_results
+        .sort_values("RoundNumber")
+        .groupby("Driver", as_index=False)
+        .tail(1)[["Driver", "Team"]]
+    )
+
+    driver_summary = driver_summary.merge(
+        latest_teams,
+        on="Driver",
+        how="left",
+    )
+
+    driver_summary["AveragePoints"] = (
+        driver_summary["Points"]
+        / driver_summary["Starts"].clip(lower=1)
+    )
+
+    recent_rounds = sorted(
+        race_results["RoundNumber"].dropna().unique()
+    )[-5:]
+
+    recent_results = race_results[
+        race_results["RoundNumber"].isin(recent_rounds)
+    ].copy()
+
+    recent_form = (
+        recent_results
+        .groupby("Driver", as_index=False)
+        .agg(
+            RecentPoints=("Points", "sum"),
+            RecentStarts=("RoundNumber", "nunique"),
+        )
+    )
+
+    recent_form["RecentForm"] = (
+        recent_form["RecentPoints"]
+        / recent_form["RecentStarts"].clip(lower=1)
+    )
+
+    driver_summary = driver_summary.merge(
+        recent_form[["Driver", "RecentForm"]],
+        on="Driver",
+        how="left",
+    )
+
+    driver_summary["RecentForm"] = (
+        driver_summary["RecentForm"]
+        .fillna(driver_summary["AveragePoints"])
+    )
+
+    # Strength combines full-season and recent results.
+    driver_summary["Strength"] = (
+        0.60 * driver_summary["AveragePoints"]
+        + 0.30 * driver_summary["RecentForm"]
+        + 0.10 * np.sqrt(driver_summary["Wins"] + 1)
+    )
+
+    driver_summary["Strength"] = (
+        driver_summary["Strength"]
+        .clip(lower=0.05)
+    )
+
+    return (
+        driver_summary
+        .sort_values(
+            ["Points", "Wins", "Podiums"],
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+
+def calculate_constructor_standings(
+    race_results: pd.DataFrame,
+) -> pd.DataFrame:
+    """Calculate current constructor standings."""
+    if race_results.empty:
+        return pd.DataFrame(
+            columns=[
+                "Team",
+                "Points",
+                "Wins",
+                "Podiums",
+                "Starts",
+            ]
+        )
+
+    constructor_summary = (
+        race_results
+        .groupby("Team", as_index=False)
+        .agg(
+            Points=("Points", "sum"),
+            Wins=("Position", lambda x: int((x == 1).sum())),
+            Podiums=("Position", lambda x: int((x <= 3).sum())),
+            Starts=("RoundNumber", "nunique"),
+        )
+        .sort_values(
+            ["Points", "Wins", "Podiums"],
+            ascending=False,
+        )
+        .reset_index(drop=True)
+    )
+
+    return constructor_summary
+
+
+# ============================================================
+# RACE WINNER PREDICTION
+# ============================================================
+
+def build_race_prediction(
+    qualifying_laps: pd.DataFrame,
+    qualifying_results: pd.DataFrame,
+    driver_standings: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Predict race-winning probabilities using:
+    - qualifying position
+    - qualifying lap-time gap
+    - season form
+    - recent form
+    """
+    if qualifying_results.empty:
+        raise ValueError("No qualifying results were available.")
+
+    qualifying = qualifying_results.copy()
+
+    qualifying["Driver"] = qualifying.apply(
+        clean_driver_name,
+        axis=1,
+    )
+
+    qualifying["GridPosition"] = pd.to_numeric(
+        qualifying.get("Position"),
+        errors="coerce",
+    )
+
+    qualifying = qualifying[
+        qualifying["GridPosition"].notna()
+    ].copy()
+
+    qualifying["GridPosition"] = (
+        qualifying["GridPosition"].astype(int)
+    )
+
+    best_lap_rows: list[dict[str, object]] = []
+
+    if not qualifying_laps.empty and "Driver" in qualifying_laps.columns:
+        valid_laps = qualifying_laps.copy()
+
+        if "IsAccurate" in valid_laps.columns:
+            accurate_mask = (
+                valid_laps["IsAccurate"].fillna(False).astype(bool)
+            )
+
+            if accurate_mask.any():
+                valid_laps = valid_laps[accurate_mask]
+
+        for driver in valid_laps["Driver"].dropna().unique():
+            driver_laps = valid_laps[
+                valid_laps["Driver"] == driver
+            ]
+
+            if driver_laps.empty or "LapTime" not in driver_laps.columns:
+                continue
+
+            lap_times = driver_laps["LapTime"].dropna()
+
+            if lap_times.empty:
+                continue
+
+            fastest_lap = lap_times.min()
+
+            try:
+                lap_seconds = fastest_lap.total_seconds()
+            except AttributeError:
+                continue
+
+            best_lap_rows.append(
+                {
+                    "Driver": str(driver),
+                    "BestLapSeconds": lap_seconds,
+                }
+            )
+
+    best_laps = pd.DataFrame(best_lap_rows)
+
+    if not best_laps.empty:
+        qualifying = qualifying.merge(
+            best_laps,
+            on="Driver",
+            how="left",
+        )
+    else:
+        qualifying["BestLapSeconds"] = np.nan
+
+    valid_best_laps = qualifying["BestLapSeconds"].dropna()
+
+    if not valid_best_laps.empty:
+        fastest_time = valid_best_laps.min()
+        qualifying["LapGap"] = (
+            qualifying["BestLapSeconds"] - fastest_time
+        )
+    else:
+        qualifying["LapGap"] = (
+            qualifying["GridPosition"] - 1
+        ) * 0.15
+
+    qualifying["LapGap"] = qualifying["LapGap"].fillna(
+        qualifying["LapGap"].median()
+        if qualifying["LapGap"].notna().any()
+        else 2.0
+    )
+
+    form_columns = [
+        "Driver",
+        "Points",
+        "AveragePoints",
+        "RecentForm",
+        "Strength",
+        "Team",
+    ]
+
+    available_form_columns = [
+        column
+        for column in form_columns
+        if column in driver_standings.columns
+    ]
+
+    qualifying = qualifying.merge(
+        driver_standings[available_form_columns],
+        on="Driver",
+        how="left",
+    )
+
+    qualifying["AveragePoints"] = qualifying[
+        "AveragePoints"
+    ].fillna(0.0)
+
+    qualifying["RecentForm"] = qualifying[
+        "RecentForm"
+    ].fillna(0.0)
+
+    qualifying["Strength"] = qualifying[
+        "Strength"
+    ].fillna(0.25)
+
+    # Smaller grid positions and lap gaps should score better.
+    grid_score = np.exp(
+        -0.22 * (qualifying["GridPosition"] - 1)
+    )
+
+    lap_score = np.exp(
+        -0.80 * qualifying["LapGap"].clip(lower=0)
+    )
+
+    season_score = (
+        qualifying["AveragePoints"] + 1
+    ) ** 0.55
+
+    recent_score = (
+        qualifying["RecentForm"] + 1
+    ) ** 0.35
+
+    raw_strength = (
+        grid_score
+        * lap_score
+        * season_score
+        * recent_score
+    )
+
+    qualifying["WinProbability"] = normalise_probabilities(
+        raw_strength.to_numpy()
+    )
+
+    return (
+        qualifying
+        .sort_values("WinProbability", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# CHAMPIONSHIP SIMULATION
+# ============================================================
+
+def simulate_finishing_order(
+    drivers: np.ndarray,
+    strengths: np.ndarray,
+    random_generator: np.random.Generator,
+) -> np.ndarray:
+    """
+    Generate one complete finishing order.
+
+    Each next driver is selected without replacement using the remaining
+    drivers' strengths as selection probabilities.
+    """
+    available_drivers = list(drivers)
+    available_strengths = list(strengths)
+    finishing_order: list[str] = []
+
+    while available_drivers:
+        probabilities = normalise_probabilities(
+            np.asarray(available_strengths)
+        )
+
+        selected_index = random_generator.choice(
+            len(available_drivers),
+            p=probabilities,
+        )
+
+        finishing_order.append(
+            available_drivers.pop(selected_index)
+        )
+        available_strengths.pop(selected_index)
+
+    return np.asarray(finishing_order)
+
+
+def apply_simulated_points(
+    finishing_order: np.ndarray,
+    championship_points: dict[str, float],
+) -> None:
+    """Apply standard points to the top ten simulated finishers."""
+    number_scoring = min(
+        len(finishing_order),
+        len(RACE_POINTS),
+    )
+
+    for position_index in range(number_scoring):
+        driver = finishing_order[position_index]
+        championship_points[driver] += RACE_POINTS[position_index]
+
+
+def resolve_driver_champion(
+    driver_points: dict[str, float],
+    driver_strengths: dict[str, float],
+    random_generator: np.random.Generator,
+) -> str:
+    """Resolve the champion, including simulated tie-breaking."""
+    maximum_points = max(driver_points.values())
+
+    leaders = [
+        driver
+        for driver, points in driver_points.items()
+        if math.isclose(points, maximum_points)
+    ]
+
+    if len(leaders) == 1:
+        return leaders[0]
+
+    leader_strengths = np.array(
+        [driver_strengths[driver] for driver in leaders]
+    )
+
+    return random_generator.choice(
+        leaders,
+        p=normalise_probabilities(leader_strengths),
+    )
+
+
+def resolve_constructor_champion(
+    constructor_points: dict[str, float],
+    random_generator: np.random.Generator,
+) -> str:
+    """Resolve a constructor championship tie."""
+    maximum_points = max(constructor_points.values())
+
+    leaders = [
+        team
+        for team, points in constructor_points.items()
+        if math.isclose(points, maximum_points)
+    ]
+
+    if len(leaders) == 1:
+        return leaders[0]
+
+    return random_generator.choice(leaders)
+
+
+def simulate_championships(
+    driver_standings: pd.DataFrame,
+    constructor_standings: pd.DataFrame,
+    remaining_races: int,
+    simulations: int,
+    random_seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Simulate the Drivers' and Constructors' Championships.
+
+    The same simulated race results are used for both championships.
+    """
+    if driver_standings.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    drivers = driver_standings["Driver"].astype(str).to_numpy()
+
+    strengths = driver_standings["Strength"].astype(float).to_numpy()
+    strengths = normalise_probabilities(strengths)
+
+    driver_to_team = dict(
+        zip(
+            driver_standings["Driver"].astype(str),
+            driver_standings["Team"].astype(str),
+        )
+    )
+
+    starting_driver_points = dict(
+        zip(
+            driver_standings["Driver"].astype(str),
+            driver_standings["Points"].astype(float),
+        )
+    )
+
+    starting_constructor_points = dict(
+        zip(
+            constructor_standings["Team"].astype(str),
+            constructor_standings["Points"].astype(float),
+        )
+    )
+
+    # Include any teams that appear in the driver table.
+    for team in driver_to_team.values():
+        starting_constructor_points.setdefault(team, 0.0)
+
+    strength_lookup = dict(zip(drivers, strengths))
+
+    driver_title_counts = {
+        driver: 0
+        for driver in drivers
+    }
+
+    constructor_title_counts = {
+        team: 0
+        for team in starting_constructor_points
+    }
+
+    driver_final_points = {
+        driver: []
+        for driver in drivers
+    }
+
+    constructor_final_points = {
+        team: []
+        for team in starting_constructor_points
+    }
+
+    random_generator = np.random.default_rng(random_seed)
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    progress_interval = max(simulations // 100, 1)
+
+    for simulation_index in range(simulations):
+        simulated_driver_points = starting_driver_points.copy()
+        simulated_constructor_points = (
+            starting_constructor_points.copy()
+        )
+
+        for _ in range(remaining_races):
+            race_order = simulate_finishing_order(
+                drivers,
+                strengths,
+                random_generator,
+            )
+
+            before_points = simulated_driver_points.copy()
+
+            apply_simulated_points(
+                race_order,
+                simulated_driver_points,
+            )
+
+            for driver in drivers:
+                points_gained = (
+                    simulated_driver_points[driver]
+                    - before_points[driver]
+                )
+
+                team = driver_to_team.get(
+                    driver,
+                    "Unknown Team",
+                )
+
+                simulated_constructor_points.setdefault(team, 0.0)
+                simulated_constructor_points[team] += points_gained
+
+        driver_champion = resolve_driver_champion(
+            simulated_driver_points,
+            strength_lookup,
+            random_generator,
+        )
+
+        constructor_champion = resolve_constructor_champion(
+            simulated_constructor_points,
+            random_generator,
+        )
+
+        driver_title_counts[driver_champion] += 1
+        constructor_title_counts[constructor_champion] += 1
+
+        for driver, points in simulated_driver_points.items():
+            driver_final_points[driver].append(points)
+
+        for team, points in simulated_constructor_points.items():
+            constructor_final_points[team].append(points)
+
+        if (
+            simulation_index % progress_interval == 0
+            or simulation_index == simulations - 1
+        ):
+            completion = (simulation_index + 1) / simulations
+            progress.progress(completion)
+            status.text(
+                f"Running championship simulation "
+                f"{simulation_index + 1:,} of {simulations:,}"
+            )
+
+    progress.empty()
+    status.empty()
+
+    driver_probabilities = pd.DataFrame(
+        {
+            "Driver": list(driver_title_counts.keys()),
+            "ChampionshipProbability": [
+                count / simulations
+                for count in driver_title_counts.values()
+            ],
+            "AverageFinalPoints": [
+                np.mean(driver_final_points[driver])
+                for driver in driver_title_counts
+            ],
+            "BestSimulatedPoints": [
+                np.max(driver_final_points[driver])
+                for driver in driver_title_counts
+            ],
+            "WorstSimulatedPoints": [
+                np.min(driver_final_points[driver])
+                for driver in driver_title_counts
+            ],
+        }
+    ).sort_values(
+        "ChampionshipProbability",
+        ascending=False,
+    )
+
+    constructor_probabilities = pd.DataFrame(
+        {
+            "Team": list(constructor_title_counts.keys()),
+            "ChampionshipProbability": [
+                count / simulations
+                for count in constructor_title_counts.values()
+            ],
+            "AverageFinalPoints": [
+                np.mean(constructor_final_points[team])
+                for team in constructor_title_counts
+            ],
+            "BestSimulatedPoints": [
+                np.max(constructor_final_points[team])
+                for team in constructor_title_counts
+            ],
+            "WorstSimulatedPoints": [
+                np.min(constructor_final_points[team])
+                for team in constructor_title_counts
+            ],
+        }
+    ).sort_values(
+        "ChampionshipProbability",
+        ascending=False,
+    )
+
+    return (
+        driver_probabilities.reset_index(drop=True),
+        constructor_probabilities.reset_index(drop=True),
+    )
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+st.sidebar.title("🏎️ F1 Dashboard")
+
+selected_year = st.sidebar.selectbox(
+    "Championship season",
+    AVAILABLE_YEARS,
+    index=len(AVAILABLE_YEARS) - 1,
+)
+
+simulation_count = st.sidebar.select_slider(
+    "Championship simulations",
+    options=[500, 1_000, 2_500, 5_000, 10_000],
+    value=DEFAULT_SIMULATIONS,
+)
+
+st.sidebar.markdown("---")
+
+refresh_data = st.sidebar.button(
+    "🔄 Clear cached data",
+    use_container_width=True,
+)
+
+if refresh_data:
+    st.cache_data.clear()
+    st.rerun()
+
+
+# ============================================================
+# LOAD SCHEDULE
+# ============================================================
+
+try:
+    schedule = load_schedule(selected_year)
+except Exception as error:
+    st.error(
+        f"Could not load the {selected_year} schedule: {error}"
+    )
+    st.stop()
+
+if schedule.empty:
+    st.error("No races were found for the selected season.")
+    st.stop()
+
+event_options = {
+    f"Round {int(row['RoundNumber'])}: {get_event_name(row)}":
+        int(row["RoundNumber"])
+    for _, row in schedule.iterrows()
+}
+
+selected_event_label = st.sidebar.selectbox(
+    "Race prediction event",
+    list(event_options.keys()),
+)
+
+selected_round = event_options[selected_event_label]
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.title("🏎️ F1 Race and Championship Predictor")
+
+st.markdown(
+    """
+    This dashboard analyses completed race results and qualifying data,
+    then simulates the remaining season to estimate:
+
+    - the selected Grand Prix winner;
+    - the Drivers' Championship winner; and
+    - the Constructors' Championship winner.
+    """
+)
+
+st.warning(
+    "These are statistical estimates, not guaranteed outcomes. "
+    "Unexpected retirements, upgrades, penalties, weather and driver "
+    "changes are not fully modelled."
+)
+
+
+# ============================================================
+# LOAD COMPLETED SEASON DATA
+# ============================================================
+
+with st.spinner(
+    f"Loading completed {selected_year} race results..."
+):
+    race_results, completed_rounds, unavailable_events = (
+        get_completed_race_data(selected_year, schedule)
+    )
+
+completed_rounds = sorted(set(completed_rounds))
+total_rounds = len(schedule)
+remaining_rounds = max(total_rounds - len(completed_rounds), 0)
+
+driver_standings = calculate_driver_standings(race_results)
+constructor_standings = calculate_constructor_standings(
+    race_results
+)
+
+metric_one, metric_two, metric_three = st.columns(3)
+
+metric_one.metric(
+    "Completed races",
+    len(completed_rounds),
+)
+
+metric_two.metric(
+    "Remaining races",
+    remaining_rounds,
+)
+
+metric_three.metric(
+    "Scheduled rounds",
+    total_rounds,
+)
+
+
+# ============================================================
+# SIMULATE CHAMPIONSHIPS
+# ============================================================
+
+driver_title_prediction = pd.DataFrame()
+constructor_title_prediction = pd.DataFrame()
+
+if not driver_standings.empty:
+    with st.spinner(
+        f"Simulating {simulation_count:,} championship outcomes..."
+    ):
+        (
+            driver_title_prediction,
+            constructor_title_prediction,
+        ) = simulate_championships(
+            driver_standings=driver_standings,
+            constructor_standings=constructor_standings,
+            remaining_races=remaining_rounds,
+            simulations=simulation_count,
+        )
+
+
+# ============================================================
+# TABS
+# ============================================================
+
+race_tab, driver_tab, constructor_tab = st.tabs(
+    [
+        "🏁 Race Winner",
+        "🏆 Drivers' Championship",
+        "🏭 Constructors' Championship",
+    ]
+)
+
+
+# ============================================================
+# RACE WINNER TAB
+# ============================================================
+
+with race_tab:
+    st.header(selected_event_label)
+
+    try:
+        with st.spinner("Loading qualifying data..."):
+            qualifying_laps, qualifying_results = (
+                load_qualifying_laps(
+                    selected_year,
+                    selected_round,
+                )
+            )
+
+        race_prediction = build_race_prediction(
+            qualifying_laps,
+            qualifying_results,
+            driver_standings,
+        )
+
+        if race_prediction.empty:
+            st.warning(
+                "No drivers were available for this race prediction."
+            )
+        else:
+            predicted_winner = race_prediction.iloc[0]
+
+            st.success(
+                f"🏆 Predicted winner: "
+                f"**{predicted_winner['Driver']}** — "
+                f"{predicted_winner['WinProbability']:.1%}"
+            )
+
+            display_race_prediction = race_prediction[
+                [
+                    "Driver",
+                    "GridPosition",
+                    "LapGap",
+                    "AveragePoints",
+                    "RecentForm",
+                    "WinProbability",
+                ]
+            ].copy()
+
+            display_race_prediction.columns = [
+                "Driver",
+                "Qualifying Position",
+                "Lap Gap",
+                "Average Season Points",
+                "Recent Points Per Race",
+                "Win Probability",
+            ]
+
+            st.dataframe(
+                display_race_prediction.style.format(
+                    {
+                        "Lap Gap": "{:.3f}s",
+                        "Average Season Points": "{:.2f}",
+                        "Recent Points Per Race": "{:.2f}",
+                        "Win Probability": "{:.2%}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            race_chart_data = race_prediction[
+                ["Driver", "WinProbability"]
+            ].copy()
+
+            race_chart_data["WinProbability"] *= 100
+
+            make_bar_chart(
+                race_chart_data,
+                category_column="Driver",
+                value_column="WinProbability",
+                title=(
+                    f"Predicted winner probabilities — "
+                    f"{selected_event_label}"
+                ),
+                x_label="Win probability (%)",
+                top_n=15,
+            )
+
+            race_csv = race_prediction.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                "Download race prediction",
+                race_csv,
+                file_name=(
+                    f"{selected_year}_round_"
+                    f"{selected_round}_prediction.csv"
+                ),
+                mime="text/csv",
+            )
+
+    except Exception as error:
+        st.warning(
+            "A race prediction could not be created. Qualifying may not have "
+            "happened yet, or FastF1 may not have returned the session results."
+        )
+
+        st.code(str(error))
+
+
+# ============================================================
+# DRIVERS' CHAMPIONSHIP TAB
+# ============================================================
+
+with driver_tab:
+    st.header(f"{selected_year} Drivers' Championship")
+
+    if driver_standings.empty:
+        st.warning(
+            "No completed race results were available for this season."
+        )
+
+    else:
+        if not driver_title_prediction.empty:
+            predicted_driver_champion = (
+                driver_title_prediction.iloc[0]
+            )
+
+            st.success(
+                f"🏆 Predicted Drivers' Champion: "
+                f"**{predicted_driver_champion['Driver']}** — "
+                f"{predicted_driver_champion['ChampionshipProbability']:.1%}"
+            )
+
+        st.subheader("Current calculated standings")
+
+        driver_display = driver_standings[
+            [
+                "Driver",
+                "Team",
+                "Points",
+                "Wins",
+                "Podiums",
+                "Starts",
+                "AveragePoints",
+                "RecentForm",
+            ]
+        ].copy()
+
+        driver_display.index = np.arange(
+            1,
+            len(driver_display) + 1,
+        )
+
+        driver_display.index.name = "Position"
+
+        driver_display.columns = [
+            "Driver",
+            "Team",
+            "Points",
+            "Wins",
+            "Podiums",
+            "Starts",
+            "Points Per Race",
+            "Recent Form",
+        ]
+
+        st.dataframe(
+            driver_display.style.format(
+                {
+                    "Points": "{:.0f}",
+                    "Points Per Race": "{:.2f}",
+                    "Recent Form": "{:.2f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        if not driver_title_prediction.empty:
+            st.subheader("Championship simulation")
+
+            driver_probability_display = (
+                driver_title_prediction.copy()
+            )
+
+            st.dataframe(
+                driver_probability_display.style.format(
+                    {
+                        "ChampionshipProbability": "{:.2%}",
+                        "AverageFinalPoints": "{:.1f}",
+                        "BestSimulatedPoints": "{:.0f}",
+                        "WorstSimulatedPoints": "{:.0f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            driver_chart_data = (
+                driver_title_prediction[
+                    ["Driver", "ChampionshipProbability"]
+                ].copy()
+            )
+
+            driver_chart_data[
+                "ChampionshipProbability"
+            ] *= 100
+
+            make_bar_chart(
+                driver_chart_data,
+                category_column="Driver",
+                value_column="ChampionshipProbability",
+                title=(
+                    f"{selected_year} Drivers' Championship "
+                    f"probabilities"
+                ),
+                x_label="Championship probability (%)",
+                top_n=15,
+            )
+
+            driver_csv = driver_title_prediction.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                "Download Drivers' Championship prediction",
+                driver_csv,
+                file_name=(
+                    f"{selected_year}_drivers_championship.csv"
+                ),
+                mime="text/csv",
+            )
+
+
+# ============================================================
+# CONSTRUCTORS' CHAMPIONSHIP TAB
+# ============================================================
+
+with constructor_tab:
+    st.header(f"{selected_year} Constructors' Championship")
+
+    if constructor_standings.empty:
+        st.warning(
+            "No constructor results were available for this season."
+        )
+
+    else:
+        if not constructor_title_prediction.empty:
+            predicted_constructor_champion = (
+                constructor_title_prediction.iloc[0]
+            )
+
+            st.success(
+                f"🏆 Predicted Constructors' Champion: "
+                f"**{predicted_constructor_champion['Team']}** — "
+                f"{predicted_constructor_champion['ChampionshipProbability']:.1%}"
+            )
+
+        st.subheader("Current calculated standings")
+
+        constructor_display = constructor_standings.copy()
+
+        constructor_display.index = np.arange(
+            1,
+            len(constructor_display) + 1,
+        )
+
+        constructor_display.index.name = "Position"
+
+        st.dataframe(
+            constructor_display.style.format(
+                {
+                    "Points": "{:.0f}",
+                }
+            ),
+            use_container_width=True,
+        )
+
+        if not constructor_title_prediction.empty:
+            st.subheader("Championship simulation")
+
+            st.dataframe(
+                constructor_title_prediction.style.format(
+                    {
+                        "ChampionshipProbability": "{:.2%}",
+                        "AverageFinalPoints": "{:.1f}",
+                        "BestSimulatedPoints": "{:.0f}",
+                        "WorstSimulatedPoints": "{:.0f}",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            constructor_chart_data = (
+                constructor_title_prediction[
+                    ["Team", "ChampionshipProbability"]
+                ].copy()
+            )
+
+            constructor_chart_data[
+                "ChampionshipProbability"
+            ] *= 100
+
+            make_bar_chart(
+                constructor_chart_data,
+                category_column="Team",
+                value_column="ChampionshipProbability",
+                title=(
+                    f"{selected_year} Constructors' Championship "
+                    f"probabilities"
+                ),
+                x_label="Championship probability (%)",
+                top_n=10,
+            )
+
+            constructor_csv = (
+                constructor_title_prediction.to_csv(
+                    index=False
+                ).encode("utf-8")
+            )
+
+            st.download_button(
+                "Download Constructors' Championship prediction",
+                constructor_csv,
+                file_name=(
+                    f"{selected_year}_constructors_championship.csv"
+                ),
+                mime="text/csv",
+            )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.markdown("---")
+
+st.caption(
+    "Prediction model: qualifying position, qualifying pace, "
+    "season points and recent form. Championship simulations use "
+    "the same simulated finishing order for both the Drivers' and "
+    "Constructors' Championships."
+)
